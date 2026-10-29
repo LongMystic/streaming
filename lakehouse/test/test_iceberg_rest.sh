@@ -16,9 +16,17 @@ TABLE=events
 pass() { echo "PASS  $1"; }
 fail() { echo "FAIL  $1"; exit 1; }
 
+# http_delete <url>  -> prints the HTTP status code (000 when the request never got an answer)
+http_delete() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "$1" || true
+}
+
+# Only runs if the script stops before its own drop steps succeed.
+CLEANED=0
 cleanup() {
-  curl -s -o /dev/null -X DELETE "$REST/namespaces/$NS/tables/$TABLE?purgeRequested=true" || true
-  curl -s -o /dev/null -X DELETE "$REST/namespaces/$NS" || true
+  [ "$CLEANED" = 1 ] && return
+  http_delete "$REST/namespaces/$NS/tables/$TABLE?purgeRequested=true" >/dev/null
+  http_delete "$REST/namespaces/$NS" >/dev/null
 }
 trap cleanup EXIT
 
@@ -64,9 +72,15 @@ mc_lakehouse stat "lh/${metadata#s3://}" >/dev/null \
   && pass "Aiven MySQL iceberg_tables points at the same metadata file" \
   || fail "catalog row in Aiven MySQL is missing or stale"
 
-curl -fs -o /dev/null -X DELETE "$REST/namespaces/$NS/tables/$TABLE?purgeRequested=true" \
-  && curl -fs -o /dev/null -X DELETE "$REST/namespaces/$NS" \
-  && pass "dropped table (purge) and namespace" \
-  || fail "could not drop $NS.$TABLE"
+code=$(http_delete "$REST/namespaces/$NS/tables/$TABLE?purgeRequested=true")
+[[ "$code" == 20? ]] \
+  && pass "dropped table $NS.$TABLE (purge)" \
+  || fail "drop table returned HTTP $code"
+
+code=$(http_delete "$REST/namespaces/$NS")
+[[ "$code" == 20? ]] \
+  && pass "dropped namespace $NS" \
+  || fail "drop namespace returned HTTP $code"
+CLEANED=1
 
 echo "All lakehouse checks passed."

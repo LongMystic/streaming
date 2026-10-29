@@ -135,16 +135,8 @@ Ghi chú:
 - **Reset:** `docker compose down -v` xoá dữ liệu MinIO nhưng **không** đụng tới Aiven. Khi đó các dòng trong `iceberg_tables` sẽ trỏ tới file không còn tồn tại. Reset sạch thì xoá luôn DB catalog trên Aiven: `DROP DATABASE iceberg_catalog;`.
 - **Aiven free tier** tự tắt service nếu lâu không dùng. Nếu `iceberg-rest` lỗi `Communications link failure` lúc khởi động, kiểm tra service trên Aiven console trước.
 
-## Kế hoạch tiếp theo: CDC với Kafka Connect
+## Dữ liệu và các luồng streaming
 
-Mục tiêu: stream thay đổi (insert/update/delete) của `appdb` trên cả hai DB vào Kafka bằng Debezium.
-
-1. **Chuẩn bị nguồn**
-   - Postgres: đổi `wal_level = logical`, tạo user `cdc` (`REPLICATION` + `SELECT` trên các bảng cần stream) và một `PUBLICATION`.
-   - MySQL: tạo user `cdc` với quyền `SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT`. Binlog ROW + GTID đã có sẵn.
-2. **Hạ tầng:** thêm `kafka` (KRaft, 1 broker), `kafka-connect` (image Debezium) và `kafka-ui` vào compose, chung network `streaming`.
-3. **Connector:** đăng ký 2 connector (Postgres, MySQL) qua REST API của Kafka Connect. File JSON cấu hình đặt trong `connect/`.
-4. **Kiểm chứng:** viết script test tương tự hiện tại. Script ghi trên primary, sau đó đọc topic bằng `kafka-console-consumer` hoặc kafka-ui và kiểm tra có đủ event `c`/`u`/`d`.
-5. **Vận hành:** theo dõi slot và độ trễ (`pg_replication_slots`, connector status). Thử các tình huống như restart connector, đổi schema bảng, hoặc replica/primary bị tắt.
-
-CDC đọc từ primary. Dùng replica làm nguồn cũng được (Postgres 16+ hỗ trợ logical decoding trên standby, MySQL replica đã bật `log_replica_updates` mặc định), nhưng phức tạp hơn nên để sau.
+- **CDC:** Debezium (`kafka-connect`) đọc từ primary của cả hai DB. Cấu hình connector nằm trong [kafka-connect/](kafka-connect/).
+- **Dữ liệu nguồn:** bộ dataset công ty chứng khoán và generator `fingen` ở [dataset/](dataset/README.md). Hướng dẫn chạy và bản đồ topic ở [dataset/generator/README.md](dataset/generator/README.md).
+- **Kế hoạch 3 luồng streaming** (Kafka Streams, Flink, Spark) ghi vào lakehouse: [consumers/PLAN.md](consumers/PLAN.md).
