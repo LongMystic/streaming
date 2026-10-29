@@ -1,0 +1,306 @@
+services:
+  postgres-primary:
+    image: postgres:17.11
+    container_name: postgres-primary
+    hostname: postgres-primary
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+      REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
+      APP_USER: ${POSTGRES_APP_USER}
+      APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      READER_USER: ${POSTGRES_READER_USER}
+      READER_PASSWORD: ${POSTGRES_READER_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./postgres/primary/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./postgres/init/01-create-users.sh:/docker-entrypoint-initdb.d/01-create-users.sh:ro
+    networks:
+      - streaming
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+  postgres-replica:
+    image: postgres:17.11
+    container_name: postgres-replica
+    hostname: postgres-replica
+    ports:
+      - "127.0.0.1:5433:5432"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PRIMARY_HOST: postgres-primary
+      REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+      REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
+      REPLICATION_SLOT: postgres_replica
+    entrypoint: ["/bin/bash", "/replica/entrypoint.sh"]
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+      - ./postgres/replica/entrypoint.sh:/replica/entrypoint.sh:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      - streaming
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${POSTGRES_PASSWORD}" psql -h 127.0.0.1 -U "$${POSTGRES_USER}" -d postgres
+          -tAc "SELECT status FROM pg_stat_wal_receiver" | grep -qx streaming
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+  mysql-primary:
+    image: mysql:8.4.13
+    container_name: mysql-primary
+    hostname: mysql-primary
+    ports:
+      - "127.0.0.1:3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_HOST: localhost
+      MYSQL_REPLICATION_USER: ${MYSQL_REPLICATION_USER}
+      MYSQL_REPLICATION_PASSWORD: ${MYSQL_REPLICATION_PASSWORD}
+      MYSQL_APP_USER: ${MYSQL_APP_USER}
+      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD}
+      MYSQL_READER_USER: ${MYSQL_READER_USER}
+      MYSQL_READER_PASSWORD: ${MYSQL_READER_PASSWORD}
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-expire-logs-seconds=604800
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    volumes:
+      - mysql-primary-data:/var/lib/mysql
+      - ./mysql/init/primary-init.sh:/docker-entrypoint-initdb.d/01-primary-init.sh:ro
+    networks:
+      - streaming
+    healthcheck:
+      # mysqladmin ping exits 0 whenever the server answers, so no credentials are needed.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+  mysql-replica:
+    image: mysql:8.4.13
+    container_name: mysql-replica
+    hostname: mysql-replica
+    ports:
+      - "127.0.0.1:3308:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_HOST: localhost
+      MYSQL_SOURCE_HOST: mysql-primary
+      MYSQL_REPLICATION_USER: ${MYSQL_REPLICATION_USER}
+      MYSQL_REPLICATION_PASSWORD: ${MYSQL_REPLICATION_PASSWORD}
+    # read_only/super_read_only are persisted by replica-init.sh: enabling them here
+    # would block the entrypoint from creating users during the first initialization.
+    command:
+      - --server-id=2
+      - --relay-log=mysql-relay-bin
+      - --relay-log-recovery=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    volumes:
+      - mysql-replica-data:/var/lib/mysql
+      - ./mysql/init/replica-init.sh:/docker-entrypoint-initdb.d/01-replica-init.sh:ro
+    networks:
+      - streaming
+    depends_on:
+      mysql-primary:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD="$${MYSQL_ROOT_PASSWORD}" mysql -uroot -e 'SHOW REPLICA STATUS\G'
+          | grep -cE 'Replica_(IO|SQL)_Running: Yes' | grep -qx 2
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+  kafka-connect:
+    image: quay.io/debezium/connect:3.7.0.Final
+    container_name: kafka-connect
+    hostname: kafka-connect
+    ports:
+      - "127.0.0.1:8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+    depends_on: 
+      kafka: { condition: service_healthy }
+      postgres-primary: { condition: service_healthy }
+      mysql-primary: { condition: service_healthy }
+    networks: [streaming]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  kafka:
+    image: apache/kafka:4.3.2
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "127.0.0.1:9094:9094"
+    environment:
+      CLUSTER_ID: streaming-lab-cluster-01
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    networks:
+      - streaming
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: kafka-ui
+    hostname: kafka-ui
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: streaming
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [streaming]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --- Lakehouse: MinIO (data + metadata files) + Iceberg REST catalog (metastore on Aiven MySQL) ---
+
+  minio:
+    # Official MinIO images are no longer published; mirror of the last release (2025-09-07).
+    image: longmystic/data:minio-RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    hostname: minio
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio-data:/data
+    networks: [streaming]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    # The server image ships `mc`, so no separate client image is needed.
+    image: longmystic/data:minio-RELEASE.2025-09-07T16-13-09Z
+    container_name: minio-init
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET}
+      LAKEHOUSE_S3_ACCESS_KEY: ${LAKEHOUSE_S3_ACCESS_KEY}
+      LAKEHOUSE_S3_SECRET_KEY: ${LAKEHOUSE_S3_SECRET_KEY}
+    volumes:
+      - ./lakehouse/minio/init.sh:/init.sh:ro
+    networks: [streaming]
+    depends_on:
+      minio: { condition: service_healthy }
+
+  iceberg-rest:
+    build: ./lakehouse/iceberg-rest
+    image: streaming/iceberg-rest:1.10.1-mysql
+    container_name: iceberg-rest
+    hostname: iceberg-rest
+    ports:
+      - "127.0.0.1:8181:8181"
+    # CATALOG_* env vars become catalog properties: strip the prefix, `__` -> `-`, `_` -> `.`
+    # (e.g. CATALOG_S3_PATH__STYLE__ACCESS -> s3.path-style-access).
+    environment:
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: "jdbc:mysql://${ICEBERG_DB_HOST}:${ICEBERG_DB_PORT}/${ICEBERG_DB_NAME}?sslMode=REQUIRED&createDatabaseIfNotExist=true"
+      CATALOG_JDBC_USER: ${ICEBERG_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD}
+      # V1 adds the iceberg_type column, which views need. Fixed once the catalog tables exist.
+      CATALOG_JDBC_SCHEMA__VERSION: V1
+      CATALOG_WAREHOUSE: s3://${LAKEHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_S3_ACCESS__KEY__ID: ${LAKEHOUSE_S3_ACCESS_KEY}
+      CATALOG_S3_SECRET__ACCESS__KEY: ${LAKEHOUSE_S3_SECRET_KEY}
+      AWS_REGION: us-east-1
+    networks: [streaming]
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8181/v1/config >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+
+networks:
+  streaming:
+    ipam:
+      config:
+        # pg_hba.conf only trusts this subnet; keep both in sync.
+        - subnet: 172.28.0.0/24
+
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  mysql-primary-data:
+  mysql-replica-data:
+  minio-data:

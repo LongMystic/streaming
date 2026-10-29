@@ -1,0 +1,16 @@
+{
+    "name": "postgres-appdb",
+    "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "postgres-primary",
+        "database.port": "5432",
+        "database.user": "cdc",
+        "database.password": "cdc_123",
+        "database.dbname": "appdb",
+        "topic.prefix": "pg",
+        "plugin.name": "pgoutput",
+        "publication.name": "dbz_publication",
+        "publication.autocreate.mode": "disabled",
+        "slot.name": "debezium_appdb"
+    }
+}
